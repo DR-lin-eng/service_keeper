@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Service Keeper - 服务保活管理脚本
-# 版本: 2.2 最终修复版
-# 功能: 多命令服务管理、日志轮转、保活守护、开机自启
+# 版本: 2.4 彻底修复版
+# 功能: 多命令服务管理、日志轮转、保活守护、开机自启、快捷键
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/services.conf"
@@ -31,6 +31,18 @@ print_color() {
     local color=$1
     shift
     echo -e "${color}$*${NC}"
+}
+
+# 清理服务名 - 新增函数
+clean_service_name() {
+    local name="$1"
+    # 移除单引号、双引号和多余空格
+    name="${name//\'/}"
+    name="${name//\"/}"
+    name="${name// /}"
+    # 移除非标准字符，只保留字母数字下划线短横线
+    name=$(echo "$name" | sed 's/[^a-zA-Z0-9_-]//g')
+    echo "$name"
 }
 
 # 初始化设置文件
@@ -67,9 +79,24 @@ EOF
 # 初始化
 load_settings
 
+# 设置快捷键
+setup_shortcut() {
+    local script_path="$SCRIPT_DIR/$(basename "$0")"
+    local bashrc_file="$HOME/.bashrc"
+    local alias_line="alias h='$script_path'"
+    
+    if ! grep -q "alias h=" "$bashrc_file" 2>/dev/null; then
+        echo "$alias_line" >> "$bashrc_file"
+        print_color $GREEN "✓ 快捷键 'h' 已设置，重新登录后生效"
+        print_color $CYAN "或者执行: source ~/.bashrc"
+    else
+        print_color $YELLOW "快捷键 'h' 已存在"
+    fi
+}
+
 # 检查命令是否运行
 is_command_running() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local cmd_index=$2
     local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
     
@@ -101,7 +128,7 @@ is_daemon_running() {
 
 # 获取服务的所有命令
 get_service_commands() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     if [[ -f "$CONFIG_FILE" ]]; then
         grep "^${service_name}=" "$CONFIG_FILE" | cut -d'=' -f2-
     fi
@@ -244,6 +271,7 @@ show_main_menu() {
     print_color $PURPLE "11. 日志管理设置"
     print_color $YELLOW "12. 设置开机自启"
     print_color $YELLOW "13. 取消开机自启"
+    print_color $PURPLE "14. 设置快捷键"
     print_color $RED "0. 退出"
     print_color $BLUE "=========================================================="
     
@@ -255,10 +283,10 @@ show_main_menu() {
     
     show_service_summary
     echo
-    echo -n "请选择操作 [0-13]: "
+    echo -n "请选择操作 [0-14]: "
 }
 
-# 显示服务列表
+# 显示服务列表 - 增强版本
 show_services_list() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         print_color $YELLOW "暂无配置的服务"
@@ -273,11 +301,21 @@ show_services_list() {
     while IFS='=' read -r name commands; do
         if [[ -n "$name" ]]; then
             has_services=true
-            local cmd_count=$(echo "$commands" | tr '|' '\n' | wc -l)
+            
+            # 清理服务名
+            local clean_name=$(clean_service_name "$name")
+            
+            # 使用数组处理命令
+            local cmd_array=()
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && cmd_array+=("$line")
+            done <<< "$(echo "$commands" | tr '|' '\n')"
+            
+            local cmd_count=${#cmd_array[@]}
             local running_count=0
             
             for ((i=1; i<=cmd_count; i++)); do
-                if is_command_running "$name" "$i"; then
+                if is_command_running "$clean_name" "$i"; then
                     ((running_count++))
                 fi
             done
@@ -294,15 +332,31 @@ show_services_list() {
                 fi
             fi
             
-            printf "%2d. %-20s " $index "$name"
+            printf "%2d. %-20s " $index "$clean_name"
             print_color $status_color "[$status]"
             printf " 命令数: %d (运行: %d)\n" "$cmd_count" "$running_count"
             
-            if [[ $cmd_count -eq 1 ]]; then
-                printf "     命令: %s\n" "$commands"
-            else
-                printf "     包含 %d 个命令\n" "$cmd_count"
-            fi
+            # 显示前3个命令的简要信息
+            for i in "${!cmd_array[@]}"; do
+                if [[ $i -lt 3 ]]; then
+                    local cmd_index=$((i + 1))
+                    local cmd="${cmd_array[i]}"
+                    local cmd_status="停止"
+                    local cmd_color=$RED
+                    
+                    if is_command_running "$clean_name" "$cmd_index"; then
+                        cmd_status="运行"
+                        cmd_color=$GREEN
+                    fi
+                    
+                    printf "     %d. " $cmd_index
+                    print_color $cmd_color "[$cmd_status]"
+                    printf " %s\n" "${cmd:0:50}..."
+                elif [[ $i -eq 3 && ${#cmd_array[@]} -gt 3 ]]; then
+                    printf "     ... 还有 %d 个命令\n" $((${#cmd_array[@]} - 3))
+                    break
+                fi
+            done
             echo
             
             ((index++))
@@ -317,7 +371,7 @@ show_services_list() {
     return 0
 }
 
-# 根据索引获取服务名
+# 根据索引获取服务名 - 修复版本
 get_service_by_index() {
     local target_index=$1
     local current_index=1
@@ -329,7 +383,8 @@ get_service_by_index() {
     while IFS='=' read -r name commands; do
         if [[ -n "$name" ]]; then
             if [[ $current_index -eq $target_index ]]; then
-                echo "$name"
+                # 返回清理后的服务名
+                clean_service_name "$name"
                 return 0
             fi
             ((current_index++))
@@ -374,9 +429,9 @@ select_service() {
 
 # 启动单个命令
 start_command() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local cmd_index=$2
-    local command=$3
+    local command="$3"
     local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
     local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
     
@@ -405,7 +460,7 @@ start_command() {
 
 # 停止单个命令
 stop_command() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local cmd_index=$2
     local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
     
@@ -431,7 +486,7 @@ stop_command() {
 
 # 启动服务的所有命令
 start_all_commands() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -442,18 +497,21 @@ start_all_commands() {
     
     print_color $BLUE "启动服务 '$service_name' 的所有命令..."
     
-    local cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            start_command "$service_name" "$cmd_index" "$cmd"
-            ((cmd_index++))
-        fi
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    for i in "${!cmd_array[@]}"; do
+        local cmd_index=$((i + 1))
+        start_command "$service_name" "$cmd_index" "${cmd_array[i]}"
     done
 }
 
 # 停止服务的所有命令
 stop_all_commands() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -477,7 +535,10 @@ add_service() {
     echo
     read -p "请输入服务名称: " service_name
     
-    if [[ -z "$service_name" ]] || [[ ! "$service_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    # 清理服务名
+    service_name=$(clean_service_name "$service_name")
+    
+    if [[ -z "$service_name" ]]; then
         print_color $RED "服务名称格式错误（只能包含字母、数字、下划线和短横线）"
         sleep 2
         return
@@ -542,11 +603,15 @@ add_service() {
     echo
     print_color $GREEN "命令列表:"
     local cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            printf "  %d. %s\n" $cmd_index "$cmd"
-            ((cmd_index++))
-        fi
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    for cmd in "${cmd_array[@]}"; do
+        printf "  %d. %s\n" $cmd_index "$cmd"
+        ((cmd_index++))
     done
     echo
     print_color $BLUE "====================================================="
@@ -582,9 +647,28 @@ manage_existing_service_menu() {
     fi
 }
 
-# 管理单个服务
+# 管理单个服务 - 完全修复版本
 manage_service() {
-    local service_name=$1
+    local service_name="$1"
+    
+    # 清理服务名中的异常字符
+    service_name=$(clean_service_name "$service_name")
+    
+    # 验证服务是否存在
+    if [[ ! -f "$CONFIG_FILE" ]] || ! grep -q "^${service_name}=" "$CONFIG_FILE"; then
+        print_color $RED "错误: 服务 '$service_name' 不存在"
+        echo
+        print_color $CYAN "调试信息:"
+        echo "  原始参数: '$1'"
+        echo "  清理后: '$service_name'"
+        echo "  配置文件中的服务:"
+        if [[ -f "$CONFIG_FILE" ]]; then
+            grep "^[^=]*=" "$CONFIG_FILE" | cut -d'=' -f1 | sed 's/^/    /'
+        fi
+        echo
+        read -p "按回车键继续..."
+        return
+    fi
     
     while true; do
         clear
@@ -654,12 +738,30 @@ manage_service() {
     done
 }
 
-# 显示服务详细信息
+# 显示服务详细信息 - 完全修复版本
 show_service_details() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
+    
+    if [[ -z "$service_name" ]]; then
+        print_color $RED "错误: 服务名为空"
+        return 1
+    fi
+    
     local commands
     commands=$(get_service_commands "$service_name")
-    local cmd_count=$(echo "$commands" | tr '|' '\n' | wc -l)
+    
+    if [[ -z "$commands" ]]; then
+        print_color $RED "错误: 服务 '$service_name' 不存在或无命令"
+        return 1
+    fi
+    
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    local cmd_count=${#cmd_array[@]}
     
     print_color $CYAN "服务详情:"
     printf "  服务名称: %s\n" "$service_name"
@@ -667,40 +769,37 @@ show_service_details() {
     echo
     
     print_color $CYAN "命令列表:"
-    local cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            local status="已停止"
-            local color=$RED
-            local pid="N/A"
-            
-            if is_command_running "$service_name" "$cmd_index"; then
-                status="运行中"
-                color=$GREEN
-                local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
-                if [[ -f "$pid_file" ]]; then
-                    pid=$(cat "$pid_file")
-                fi
+    for i in "${!cmd_array[@]}"; do
+        local cmd_index=$((i + 1))
+        local cmd="${cmd_array[i]}"
+        local status="已停止"
+        local color=$RED
+        local pid="N/A"
+        
+        if is_command_running "$service_name" "$cmd_index"; then
+            status="运行中"
+            color=$GREEN
+            local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
+            if [[ -f "$pid_file" ]]; then
+                pid=$(cat "$pid_file")
             fi
-            
-            printf "  %d. " $cmd_index
-            print_color $color "[$status]"
-            printf " PID: %-8s\n" "$pid"
-            printf "     命令: %s\n" "$cmd"
-            
-            local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
-            local log_size=$(get_human_readable_size "$log_file")
-            printf "     日志: %s\n" "$log_size"
-            echo
-            
-            ((cmd_index++))
         fi
+        
+        printf "  %d. " $cmd_index
+        print_color $color "[$status]"
+        printf " PID: %-8s\n" "$pid"
+        printf "     命令: %s\n" "$cmd"
+        
+        local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
+        local log_size=$(get_human_readable_size "$log_file")
+        printf "     日志: %s\n" "$log_size"
+        echo
     done
 }
 
 # 添加命令到现有服务
 add_command_to_service() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     
     clear
     print_color $BLUE "================ 为服务 '$service_name' 添加新命令 ================"
@@ -733,7 +832,11 @@ add_command_to_service() {
     local new_commands="${current_commands}|${new_command}"
     
     if [[ -f "$CONFIG_FILE" ]]; then
-        sed -i "s|^${service_name}=.*|${service_name}=${new_commands}|" "$CONFIG_FILE"
+        # 使用临时文件确保安全更新
+        local temp_file="${CONFIG_FILE}.tmp"
+        grep -v "^${service_name}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
+        echo "${service_name}=${new_commands}" >> "$temp_file"
+        mv "$temp_file" "$CONFIG_FILE"
     fi
     
     print_color $GREEN "✓ 新命令添加成功！"
@@ -750,12 +853,19 @@ add_command_to_service() {
     read -p "按回车键继续..."
 }
 
-# 删除服务中的命令
+# 删除服务中的命令 - 修复版本
 remove_command_from_service() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local commands
     commands=$(get_service_commands "$service_name")
-    local cmd_count=$(echo "$commands" | tr '|' '\n' | wc -l)
+    
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    local cmd_count=${#cmd_array[@]}
     
     if [[ $cmd_count -eq 1 ]]; then
         print_color $RED "服务只有一个命令，不能删除。如需删除请删除整个服务。"
@@ -768,22 +878,20 @@ remove_command_from_service() {
     echo
     
     print_color $CYAN "当前命令列表:"
-    local cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            local status="已停止"
-            local color=$RED
-            
-            if is_command_running "$service_name" "$cmd_index"; then
-                status="运行中"
-                color=$GREEN
-            fi
-            
-            printf "  %d. " $cmd_index
-            print_color $color "[$status]"
-            printf " %s\n" "$cmd"
-            ((cmd_index++))
+    for i in "${!cmd_array[@]}"; do
+        local cmd_index=$((i + 1))
+        local cmd="${cmd_array[i]}"
+        local status="已停止"
+        local color=$RED
+        
+        if is_command_running "$service_name" "$cmd_index"; then
+            status="运行中"
+            color=$GREEN
         fi
+        
+        printf "  %d. " $cmd_index
+        print_color $color "[$status]"
+        printf " %s\n" "$cmd"
     done
     
     echo
@@ -795,8 +903,7 @@ remove_command_from_service() {
         return
     fi
     
-    local cmd_to_delete_content
-    cmd_to_delete_content=$(echo "$commands" | tr '|' '\n' | sed -n "${cmd_to_delete}p")
+    local cmd_to_delete_content="${cmd_array[$((cmd_to_delete - 1))]}"
     
     echo
     print_color $RED "警告: 即将删除命令: $cmd_to_delete_content"
@@ -812,26 +919,31 @@ remove_command_from_service() {
         stop_command "$service_name" "$cmd_to_delete"
     fi
     
-    local temp_commands=()
-    local current_index=1
-    while read -r cmd; do
-        if [[ -n "$cmd" && $current_index -ne $cmd_to_delete ]]; then
-            temp_commands+=("$cmd")
+    # 重建命令列表，排除要删除的命令
+    local new_cmd_array=()
+    for i in "${!cmd_array[@]}"; do
+        local cmd_index=$((i + 1))
+        if [[ $cmd_index -ne $cmd_to_delete ]]; then
+            new_cmd_array+=("${cmd_array[i]}")
         fi
-        ((current_index++))
-    done <<< "$(echo "$commands" | tr '|' '\n')"
+    done
     
+    # 将数组转换为以|分隔的字符串
     local new_commands=""
-    for i in "${!temp_commands[@]}"; do
+    for i in "${!new_cmd_array[@]}"; do
         if [[ $i -eq 0 ]]; then
-            new_commands="${temp_commands[$i]}"
+            new_commands="${new_cmd_array[i]}"
         else
-            new_commands="${new_commands}|${temp_commands[$i]}"
+            new_commands="${new_commands}|${new_cmd_array[i]}"
         fi
     done
     
     if [[ -f "$CONFIG_FILE" ]]; then
-        sed -i "s|^${service_name}=.*|${service_name}=${new_commands}|" "$CONFIG_FILE"
+        # 使用临时文件确保安全更新
+        local temp_file="${CONFIG_FILE}.tmp"
+        grep -v "^${service_name}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
+        echo "${service_name}=${new_commands}" >> "$temp_file"
+        mv "$temp_file" "$CONFIG_FILE"
     fi
     
     reorganize_service_files "$service_name"
@@ -843,7 +955,7 @@ remove_command_from_service() {
 
 # 重新整理服务文件
 reorganize_service_files() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -859,43 +971,52 @@ reorganize_service_files() {
     
     rm -f "$PID_DIR/${service_name}_"*.pid
     
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
     local new_cmd_index=1
     local old_cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            while [[ $old_cmd_index -le $max_old_index ]]; do
-                if [[ -n "${running_pids[$old_cmd_index]}" ]]; then
-                    if kill -0 "${running_pids[$old_cmd_index]}" 2>/dev/null; then
-                        echo "${running_pids[$old_cmd_index]}" > "$PID_DIR/${service_name}_${new_cmd_index}.pid"
-                        break
-                    fi
+    for cmd in "${cmd_array[@]}"; do
+        while [[ $old_cmd_index -le $max_old_index ]]; do
+            if [[ -n "${running_pids[$old_cmd_index]}" ]]; then
+                if kill -0 "${running_pids[$old_cmd_index]}" 2>/dev/null; then
+                    echo "${running_pids[$old_cmd_index]}" > "$PID_DIR/${service_name}_${new_cmd_index}.pid"
+                    break
                 fi
-                ((old_cmd_index++))
-            done
+            fi
             ((old_cmd_index++))
-            ((new_cmd_index++))
-        fi
+        done
+        ((old_cmd_index++))
+        ((new_cmd_index++))
     done
 }
 
-# 修改服务中的命令
+# 修改服务中的命令 - 修复版本
 modify_command_in_service() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local commands
     commands=$(get_service_commands "$service_name")
-    local cmd_count=$(echo "$commands" | tr '|' '\n' | wc -l)
+    
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    local cmd_count=${#cmd_array[@]}
     
     clear
     print_color $BLUE "================ 修改服务 '$service_name' 中的命令 ================"
     echo
     
     print_color $CYAN "当前命令列表:"
-    local cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            printf "  %d. %s\n" $cmd_index "$cmd"
-            ((cmd_index++))
-        fi
+    for i in "${!cmd_array[@]}"; do
+        local cmd_index=$((i + 1))
+        local cmd="${cmd_array[i]}"
+        printf "  %d. %s\n" $cmd_index "$cmd"
     done
     
     echo
@@ -907,8 +1028,7 @@ modify_command_in_service() {
         return
     fi
     
-    local current_cmd
-    current_cmd=$(echo "$commands" | tr '|' '\n' | sed -n "${cmd_to_modify}p")
+    local current_cmd="${cmd_array[$((cmd_to_modify - 1))]}"
     
     echo
     print_color $CYAN "当前命令: $current_cmd"
@@ -934,30 +1054,25 @@ modify_command_in_service() {
         stop_command "$service_name" "$cmd_to_modify"
     fi
     
-    local temp_commands=()
-    local current_index=1
-    while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            if [[ $current_index -eq $cmd_to_modify ]]; then
-                temp_commands+=("$new_cmd")
-            else
-                temp_commands+=("$cmd")
-            fi
-            ((current_index++))
-        fi
-    done <<< "$(echo "$commands" | tr '|' '\n')"
+    # 更新命令数组
+    cmd_array[$((cmd_to_modify - 1))]="$new_cmd"
     
+    # 将数组转换为以|分隔的字符串
     local new_commands=""
-    for i in "${!temp_commands[@]}"; do
+    for i in "${!cmd_array[@]}"; do
         if [[ $i -eq 0 ]]; then
-            new_commands="${temp_commands[$i]}"
+            new_commands="${cmd_array[i]}"
         else
-            new_commands="${new_commands}|${temp_commands[$i]}"
+            new_commands="${new_commands}|${cmd_array[i]}"
         fi
     done
     
     if [[ -f "$CONFIG_FILE" ]]; then
-        sed -i "s|^${service_name}=.*|${service_name}=${new_commands}|" "$CONFIG_FILE"
+        # 使用临时文件确保安全更新
+        local temp_file="${CONFIG_FILE}.tmp"
+        grep -v "^${service_name}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
+        echo "${service_name}=${new_commands}" >> "$temp_file"
+        mv "$temp_file" "$CONFIG_FILE"
     fi
     
     print_color $GREEN "✓ 命令修改成功！"
@@ -975,52 +1090,57 @@ modify_command_in_service() {
 
 # 启动单个命令菜单
 start_single_command_menu() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     select_and_operate_command "$service_name" "启动" "start"
 }
 
 # 停止单个命令菜单
 stop_single_command_menu() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     select_and_operate_command "$service_name" "停止" "stop"
 }
 
 # 重启单个命令菜单
 restart_single_command_menu() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     select_and_operate_command "$service_name" "重启" "restart"
 }
 
-# 选择并操作命令
+# 选择并操作命令 - 修复版本
 select_and_operate_command() {
-    local service_name=$1
-    local action=$2
-    local operation=$3
+    local service_name=$(clean_service_name "$1")
+    local action="$2"
+    local operation="$3"
     local commands
     commands=$(get_service_commands "$service_name")
-    local cmd_count=$(echo "$commands" | tr '|' '\n' | wc -l)
+    
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    local cmd_count=${#cmd_array[@]}
     
     clear
     print_color $BLUE "================ ${action}单个命令: $service_name ================"
     echo
     
     print_color $CYAN "选择要${action}的命令:"
-    local cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            local status="已停止"
-            local color=$RED
-            
-            if is_command_running "$service_name" "$cmd_index"; then
-                status="运行中"
-                color=$GREEN
-            fi
-            
-            printf "  %d. " $cmd_index
-            print_color $color "[$status]"
-            printf " %s\n" "$cmd"
-            ((cmd_index++))
+    for i in "${!cmd_array[@]}"; do
+        local cmd_index=$((i + 1))
+        local cmd="${cmd_array[i]}"
+        local status="已停止"
+        local color=$RED
+        
+        if is_command_running "$service_name" "$cmd_index"; then
+            status="运行中"
+            color=$GREEN
         fi
+        
+        printf "  %d. " $cmd_index
+        print_color $color "[$status]"
+        printf " %s\n" "$cmd"
     done
     
     echo
@@ -1036,8 +1156,7 @@ select_and_operate_command() {
         return
     fi
     
-    local selected_cmd
-    selected_cmd=$(echo "$commands" | tr '|' '\n' | sed -n "${cmd_choice}p")
+    local selected_cmd="${cmd_array[$((cmd_choice - 1))]}"
     
     echo
     case $operation in
@@ -1061,7 +1180,7 @@ select_and_operate_command() {
 
 # 确认删除服务
 confirm_delete_service() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     
     print_color $RED "警告: 即将删除服务 '$service_name' 及其所有命令！"
     print_color $YELLOW "这将会："
@@ -1127,7 +1246,7 @@ restart_service_menu() {
     fi
 }
 
-# 查看服务状态
+# 查看服务状态 - 修复版本
 show_status() {
     clear
     print_color $BLUE "====================== 服务状态总览 ======================"
@@ -1149,44 +1268,52 @@ show_status() {
         if [[ -n "$name" ]]; then
             ((total_services++))
             local service_running=false
-            local cmd_count=$(echo "$commands" | tr '|' '\n' | wc -l)
+            local clean_name=$(clean_service_name "$name")
+            
+            # 使用数组避免子shell问题
+            local cmd_array=()
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && cmd_array+=("$line")
+            done <<< "$(echo "$commands" | tr '|' '\n')"
+            
+            local cmd_count=${#cmd_array[@]}
             total_commands=$((total_commands + cmd_count))
             local service_running_count=0
             
-            print_color $CYAN "服务: $name"
+            print_color $CYAN "服务: $clean_name"
             
-            local cmd_index=1
-            echo "$commands" | tr '|' '\n' | while read -r cmd; do
-                if [[ -n "$cmd" ]]; then
-                    local status="已停止"
-                    local color=$RED
-                    local pid="N/A"
+            for i in "${!cmd_array[@]}"; do
+                local cmd_index=$((i + 1))
+                local cmd="${cmd_array[i]}"
+                local status="已停止"
+                local color=$RED
+                local pid="N/A"
+                
+                if is_command_running "$clean_name" "$cmd_index"; then
+                    status="运行中"
+                    color=$GREEN
+                    service_running=true
+                    ((running_commands++))
+                    ((service_running_count++))
                     
-                    if is_command_running "$name" "$cmd_index"; then
-                        status="运行中"
-                        color=$GREEN
-                        service_running=true
-                        ((running_commands++))
-                        ((service_running_count++))
-                        
-                        local pid_file="$PID_DIR/${name}_${cmd_index}.pid"
-                        if [[ -f "$pid_file" ]]; then
-                            pid=$(cat "$pid_file")
-                        fi
+                    local pid_file="$PID_DIR/${clean_name}_${cmd_index}.pid"
+                    if [[ -f "$pid_file" ]]; then
+                        pid=$(cat "$pid_file")
                     fi
-                    
-                    printf "  命令 %d: " $cmd_index
-                    print_color $color "[$status]"
-                    printf " PID: %-8s %s\n" "$pid" "$cmd"
-                    
-                    local log_file="$LOG_DIR/${name}_${cmd_index}.log"
-                    local log_size=$(get_human_readable_size "$log_file")
-                    printf "           日志: %s\n" "$log_size"
-                    
-                    ((cmd_index++))
                 fi
+                
+                printf "  命令 %d: " $cmd_index
+                print_color $color "[$status]"
+                printf " PID: %-8s %s\n" "$pid" "$cmd"
+                
+                local log_file="$LOG_DIR/${clean_name}_${cmd_index}.log"
+                local log_size=$(get_human_readable_size "$log_file")
+                printf "           日志: %s\n" "$log_size"
             done
             
+            if [[ "$service_running" == "true" ]]; then
+                ((running_services++))
+            fi
             echo
         fi
     done < "$CONFIG_FILE"
@@ -1220,12 +1347,19 @@ show_logs_menu() {
     fi
 }
 
-# 查看服务日志
+# 查看服务日志 - 修复版本
 show_service_logs() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local commands
     commands=$(get_service_commands "$service_name")
-    local cmd_count=$(echo "$commands" | tr '|' '\n' | wc -l)
+    
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    local cmd_count=${#cmd_array[@]}
     
     clear
     print_color $BLUE "================= $service_name 服务日志 ================="
@@ -1237,39 +1371,37 @@ show_service_logs() {
         print_color $CYAN "该服务有 $cmd_count 个命令，请选择要查看的日志:"
         echo
         
-        local cmd_index=1
-        echo "$commands" | tr '|' '\n' | while read -r cmd; do
-            if [[ -n "$cmd" ]]; then
-                local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
-                local log_size=$(get_human_readable_size "$log_file")
-                local status="停止"
-                local color=$RED
-                
-                if is_command_running "$service_name" "$cmd_index"; then
-                    status="运行中"
-                    color=$GREEN
-                fi
-                
-                printf "%2d. 命令 %d " $cmd_index $cmd_index
-                print_color $color "[$status]"
-                printf " 日志: %s\n" "$log_size"
-                printf "    %s\n" "$cmd"
-                echo
-                ((cmd_index++))
+        for i in "${!cmd_array[@]}"; do
+            local cmd_index=$((i + 1))
+            local cmd="${cmd_array[i]}"
+            local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
+            local log_size=$(get_human_readable_size "$log_file")
+            local status="停止"
+            local color=$RED
+            
+            if is_command_running "$service_name" "$cmd_index"; then
+                status="运行中"
+                color=$GREEN
             fi
+            
+            printf "%2d. 命令 %d " $cmd_index $cmd_index
+            print_color $color "[$status]"
+            printf " 日志: %s\n" "$log_size"
+            printf "    %s\n" "$cmd"
+            echo
         done
         
         print_color $BLUE "======================================================"
-        echo "$((cmd_index)). 查看所有日志"
+        echo "$((cmd_count + 1)). 查看所有日志"
         echo "0. 返回"
         echo
-        read -p "请选择 [0-$cmd_index]: " choice
+        read -p "请选择 [0-$((cmd_count + 1))]: " choice
         
         if [[ "$choice" == "0" ]]; then
             return
-        elif [[ "$choice" == "$cmd_index" ]]; then
+        elif [[ "$choice" == "$((cmd_count + 1))" ]]; then
             show_all_service_logs "$service_name"
-        elif [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le $((cmd_index-1)) ]]; then
+        elif [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le $cmd_count ]]; then
             show_single_log "$service_name" "$choice"
         else
             print_color $RED "无效选择"
@@ -1280,8 +1412,8 @@ show_service_logs() {
 
 # 显示单个命令的日志
 show_single_log() {
-    local service_name=$1
-    local cmd_index=$2
+    local service_name=$(clean_service_name "$1")
+    local cmd_index="$2"
     local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
     
     clear
@@ -1330,9 +1462,9 @@ show_single_log() {
     fi
 }
 
-# 显示所有服务日志
+# 显示所有服务日志 - 修复版本
 show_all_service_logs() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -1340,20 +1472,24 @@ show_all_service_logs() {
     print_color $BLUE "============ $service_name 所有命令日志 ============"
     echo
     
-    local cmd_index=1
-    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-        if [[ -n "$cmd" ]]; then
-            local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
-            
-            print_color $CYAN "=== 命令 $cmd_index: $cmd ==="
-            if [[ -f "$log_file" ]]; then
-                tail -n 10 "$log_file"
-            else
-                print_color $YELLOW "日志文件不存在"
-            fi
-            echo
-            ((cmd_index++))
+    # 使用数组避免子shell问题
+    local cmd_array=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_array+=("$line")
+    done <<< "$(echo "$commands" | tr '|' '\n')"
+    
+    for i in "${!cmd_array[@]}"; do
+        local cmd_index=$((i + 1))
+        local cmd="${cmd_array[i]}"
+        local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
+        
+        print_color $CYAN "=== 命令 $cmd_index: $cmd ==="
+        if [[ -f "$log_file" ]]; then
+            tail -n 10 "$log_file"
+        else
+            print_color $YELLOW "日志文件不存在"
         fi
+        echo
     done
     
     read -p "按回车键继续..."
@@ -1375,7 +1511,7 @@ delete_service_menu() {
 
 # 删除服务
 delete_service() {
-    local service_name=$1
+    local service_name=$(clean_service_name "$1")
     
     stop_all_commands "$service_name"
     
@@ -1549,7 +1685,7 @@ stop_daemon() {
     print_color $GREEN "✓ 保活守护进程已停止"
 }
 
-# 守护进程主循环
+# 守护进程主循环 - 修复版本
 daemon_loop() {
     echo "$(date): 保活守护进程启动" >> "$LOG_DIR/daemon.log"
     
@@ -1559,17 +1695,24 @@ daemon_loop() {
         if [[ -f "$CONFIG_FILE" ]]; then
             while IFS='=' read -r name commands; do
                 if [[ -n "$name" ]]; then
-                    local cmd_index=1
-                    echo "$commands" | tr '|' '\n' | while read -r cmd; do
-                        if [[ -n "$cmd" ]]; then
-                            if ! is_command_running "$name" "$cmd_index"; then
-                                echo "$(date): 检测到服务 '$name' 命令 $cmd_index 已停止，正在重启..." >> "$LOG_DIR/daemon.log"
-                                start_command "$name" "$cmd_index" "$cmd" >> "$LOG_DIR/daemon.log" 2>&1
-                            else
-                                local log_file="$LOG_DIR/${name}_${cmd_index}.log"
-                                check_and_clean_log "$log_file"
-                            fi
-                            ((cmd_index++))
+                    local clean_name=$(clean_service_name "$name")
+                    
+                    # 使用数组避免子shell问题
+                    local cmd_array=()
+                    while IFS= read -r line; do
+                        [[ -n "$line" ]] && cmd_array+=("$line")
+                    done <<< "$(echo "$commands" | tr '|' '\n')"
+                    
+                    for i in "${!cmd_array[@]}"; do
+                        local cmd_index=$((i + 1))
+                        local cmd="${cmd_array[i]}"
+                        
+                        if ! is_command_running "$clean_name" "$cmd_index"; then
+                            echo "$(date): 检测到服务 '$clean_name' 命令 $cmd_index 已停止，正在重启..." >> "$LOG_DIR/daemon.log"
+                            start_command "$clean_name" "$cmd_index" "$cmd" >> "$LOG_DIR/daemon.log" 2>&1
+                        else
+                            local log_file="$LOG_DIR/${clean_name}_${cmd_index}.log"
+                            check_and_clean_log "$log_file"
                         fi
                     done
                 fi
@@ -1642,8 +1785,9 @@ autostart_all() {
     
     while IFS='=' read -r name commands; do
         if [[ -n "$name" ]]; then
-            echo "$(date): 启动服务 $name" >> "$LOG_DIR/autostart.log"
-            start_all_commands "$name" >> "$LOG_DIR/autostart.log" 2>&1
+            local clean_name=$(clean_service_name "$name")
+            echo "$(date): 启动服务 $clean_name" >> "$LOG_DIR/autostart.log"
+            start_all_commands "$clean_name" >> "$LOG_DIR/autostart.log" 2>&1
             sleep 2
         fi
     done < "$CONFIG_FILE"
@@ -1670,9 +1814,13 @@ case "$1" in
         stop_daemon
         exit 0
         ;;
+    --setup-shortcut)
+        setup_shortcut
+        exit 0
+        ;;
     --help|-h)
         echo "Service Keeper - 服务保活管理器"
-        echo "版本: 2.2 最终修复版"
+        echo "版本: 2.4 彻底修复版"
         echo "用法: $0 [选项]"
         echo ""
         echo "选项:"
@@ -1680,6 +1828,7 @@ case "$1" in
         echo "  --daemon         运行守护进程"
         echo "  --start-daemon   启动守护进程"
         echo "  --stop-daemon    停止守护进程"
+        echo "  --setup-shortcut 设置快捷键"
         echo "  --help, -h       显示此帮助信息"
         echo ""
         echo "功能特性:"
@@ -1689,6 +1838,8 @@ case "$1" in
         echo "  • 开机自启动"
         echo "  • 详细状态监控"
         echo "  • 动态服务管理"
+        echo "  • 快捷键支持"
+        echo "  • 服务名清理功能"
         exit 0
         ;;
 esac
@@ -1747,6 +1898,12 @@ while true; do
         13) 
             echo
             remove_autostart
+            echo
+            read -p "按回车键继续..."
+            ;;
+        14)
+            echo
+            setup_shortcut
             echo
             read -p "按回车键继续..."
             ;;
