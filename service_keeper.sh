@@ -123,7 +123,7 @@ add_service() {
     fi
     
     # 检查服务是否已存在
-    if grep -q "^$service_name=" "$CONFIG_FILE" 2>/dev/null; then
+    if grep -q "^${service_name}=" "$CONFIG_FILE" 2>/dev/null; then
         print_color $RED "服务 '$service_name' 已存在"
         return 1
     fi
@@ -163,10 +163,9 @@ list_services() {
                 color=$GREEN
             fi
             
-            # 修复颜色输出问题
-            local status_colored
-            status_colored=$(print_color $color "$status")
-            printf "%2d. %-20s [%s] %s\n" $index "$name" "$status_colored" "$command"
+            printf "%2d. %-20s " $index "$name"
+            print_color $color "[$status]"
+            printf " %s\n" "$command"
             ((index++))
         fi
     done < "$CONFIG_FILE"
@@ -175,7 +174,9 @@ list_services() {
 
 # 选择服务
 select_service() {
-    list_services || return 1
+    if ! list_services; then
+        return 1
+    fi
     echo
     read -p "请输入服务名称: " service_name
     
@@ -184,7 +185,7 @@ select_service() {
         return 1
     fi
     
-    if ! grep -q "^$service_name=" "$CONFIG_FILE" 2>/dev/null; then
+    if ! grep -q "^${service_name}=" "$CONFIG_FILE" 2>/dev/null; then
         print_color $RED "服务 '$service_name' 不存在"
         return 1
     fi
@@ -195,7 +196,7 @@ select_service() {
 # 获取服务命令
 get_service_command() {
     local service_name=$1
-    grep "^$service_name=" "$CONFIG_FILE" | cut -d'=' -f2-
+    grep "^${service_name}=" "$CONFIG_FILE" | cut -d'=' -f2-
 }
 
 # 查看服务状态
@@ -228,11 +229,9 @@ show_status() {
                 fi
             fi
             
-            printf "%-20s [%s] PID: %-8s %s\n" \
-                "$name" \
-                "$(print_color $color $status)" \
-                "$pid" \
-                "$command"
+            printf "%-20s " "$name"
+            print_color $color "[$status]"
+            printf " PID: %-8s %s\n" "$pid" "$command"
         fi
     done < "$CONFIG_FILE"
     
@@ -272,7 +271,7 @@ delete_service() {
     fi
     
     # 从配置文件删除
-    grep -v "^$service_name=" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null
+    grep -v "^${service_name}=" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null
     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" 2>/dev/null
     
     # 删除相关文件
