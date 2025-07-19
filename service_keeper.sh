@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Service Keeper - 服务保活管理脚本
-# 版本: 2.4 彻底修复版
-# 功能: 多命令服务管理、日志轮转、保活守护、开机自启、快捷键
+# 版本: 2.8 配置文件扫描修复版 - 解决配置文件手动修改同步问题
+# 功能: 多命令服务管理、日志轮转、保活守护、开机自启、快捷键、配置文件扫描
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/services.conf"
@@ -10,6 +10,7 @@ PID_DIR="$SCRIPT_DIR/pids"
 LOG_DIR="$SCRIPT_DIR/logs"
 DAEMON_PID_FILE="$SCRIPT_DIR/service_keeper_daemon.pid"
 SETTINGS_FILE="$SCRIPT_DIR/settings.conf"
+CONFIG_CHECKSUM_FILE="$SCRIPT_DIR/.config_checksum"
 
 # 创建必要目录
 mkdir -p "$PID_DIR" "$LOG_DIR"
@@ -26,23 +27,11 @@ CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
 NC='\033[0m'
 
-# 打印彩色输出
+# 颜色输出函数
 print_color() {
     local color=$1
     shift
     echo -e "${color}$*${NC}"
-}
-
-# 清理服务名 - 新增函数
-clean_service_name() {
-    local name="$1"
-    # 移除单引号、双引号和多余空格
-    name="${name//\'/}"
-    name="${name//\"/}"
-    name="${name// /}"
-    # 移除非标准字符，只保留字母数字下划线短横线
-    name=$(echo "$name" | sed 's/[^a-zA-Z0-9_-]//g')
-    echo "$name"
 }
 
 # 初始化设置文件
@@ -52,6 +41,7 @@ init_settings() {
 LOG_MAX_SIZE=1M
 LOG_AUTO_CLEAN=true
 LOG_BACKUP_COUNT=3
+AUTO_SYNC_CONFIG=true
 EOF
     fi
 }
@@ -65,6 +55,7 @@ load_settings() {
     LOG_MAX_SIZE=${LOG_MAX_SIZE:-$DEFAULT_LOG_MAX_SIZE}
     LOG_AUTO_CLEAN=${LOG_AUTO_CLEAN:-true}
     LOG_BACKUP_COUNT=${LOG_BACKUP_COUNT:-3}
+    AUTO_SYNC_CONFIG=${AUTO_SYNC_CONFIG:-true}
 }
 
 # 保存设置
@@ -73,11 +64,398 @@ save_settings() {
 LOG_MAX_SIZE=${LOG_MAX_SIZE}
 LOG_AUTO_CLEAN=${LOG_AUTO_CLEAN}
 LOG_BACKUP_COUNT=${LOG_BACKUP_COUNT}
+AUTO_SYNC_CONFIG=${AUTO_SYNC_CONFIG}
 EOF
 }
 
 # 初始化
 load_settings
+
+# 计算配置文件校验和
+get_config_checksum() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        md5sum "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f1
+    else
+        echo "no_config"
+    fi
+}
+
+# 检查配置文件是否发生变化
+config_changed() {
+    local current_checksum=$(get_config_checksum)
+    local stored_checksum=""
+    
+    if [[ -f "$CONFIG_CHECKSUM_FILE" ]]; then
+        stored_checksum=$(cat "$CONFIG_CHECKSUM_FILE")
+    fi
+    
+    if [[ "$current_checksum" != "$stored_checksum" ]]; then
+        return 0  # 配置已变化
+    else
+        return 1  # 配置未变化
+    fi
+}
+
+# 更新配置文件校验和
+update_config_checksum() {
+    get_config_checksum > "$CONFIG_CHECKSUM_FILE"
+}
+
+# 验证配置文件格式
+validate_config_file() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 0  # 文件不存在是正常的
+    fi
+    
+    local line_num=0
+    local errors=0
+    
+    while IFS= read -r line; do
+        ((line_num++))
+        
+        # 跳过空行和注释
+        if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+            continue
+        fi
+        
+        # 检查格式：service_name=command1|command2|...
+        if [[ ! "$line" =~ ^[a-zA-Z0-9_-]+= ]]; then
+            print_color $RED "配置文件第 $line_num 行格式错误: $line"
+            ((errors++))
+        fi
+    done < "$CONFIG_FILE"
+    
+    if [[ $errors -gt 0 ]]; then
+        print_color $RED "配置文件包含 $errors 个错误"
+        return 1
+    fi
+    
+    return 0
+}
+
+# 扫描并同步配置文件变化
+sync_config_changes() {
+    if [[ "$AUTO_SYNC_CONFIG" != "true" ]]; then
+        return 0
+    fi
+    
+    if ! config_changed; then
+        return 0  # 配置未变化
+    fi
+    
+    print_color $YELLOW "检测到配置文件变化，正在同步..."
+    
+    # 验证配置文件格式
+    if ! validate_config_file; then
+        print_color $RED "配置文件格式错误，跳过同步"
+        return 1
+    fi
+    
+    # 获取当前配置中的所有服务
+    local current_services=()
+    if [[ -f "$CONFIG_FILE" ]]; then
+        while IFS='=' read -r name commands; do
+            if [[ -n "$name" ]]; then
+                current_services+=("$name")
+            fi
+        done < "$CONFIG_FILE"
+    fi
+    
+    # 清理不存在的服务的PID和日志文件
+    cleanup_orphaned_files "${current_services[@]}"
+    
+    # 重新组织现有服务的文件索引
+    for service_name in "${current_services[@]}"; do
+        reorganize_service_files "$service_name"
+    done
+    
+    # 更新校验和
+    update_config_checksum
+    
+    print_color $GREEN "✓ 配置文件同步完成"
+}
+
+# 清理孤立的PID和日志文件
+cleanup_orphaned_files() {
+    local current_services=("$@")
+    
+    # 获取所有存在的PID文件
+    local existing_pid_files=()
+    if ls "$PID_DIR"/*.pid >/dev/null 2>&1; then
+        for pid_file in "$PID_DIR"/*.pid; do
+            existing_pid_files+=("$(basename "$pid_file")")
+        done
+    fi
+    
+    # 检查每个PID文件是否对应有效的服务
+    for pid_file in "${existing_pid_files[@]}"; do
+        if [[ "$pid_file" == "service_keeper_daemon.pid" ]]; then
+            continue  # 跳过守护进程PID文件
+        fi
+        
+        # 提取服务名（假设格式为 service_name_index.pid）
+        local service_name="${pid_file%_*.pid}"
+        local found=false
+        
+        for current_service in "${current_services[@]}"; do
+            if [[ "$service_name" == "$current_service" ]]; then
+                found=true
+                break
+            fi
+        done
+        
+        if [[ "$found" == "false" ]]; then
+            print_color $YELLOW "清理孤立的PID文件: $pid_file"
+            # 尝试停止进程
+            local pid_path="$PID_DIR/$pid_file"
+            if [[ -f "$pid_path" ]]; then
+                local pid=$(cat "$pid_path")
+                if kill -0 "$pid" 2>/dev/null; then
+                    print_color $BLUE "停止孤立进程: $pid"
+                    kill -TERM "$pid" 2>/dev/null
+                    sleep 1
+                    if kill -0 "$pid" 2>/dev/null; then
+                        kill -KILL "$pid" 2>/dev/null
+                    fi
+                fi
+                rm -f "$pid_path"
+            fi
+        fi
+    done
+    
+    # 询问是否清理孤立的日志文件
+    local orphaned_logs=()
+    if ls "$LOG_DIR"/*.log >/dev/null 2>&1; then
+        for log_file in "$LOG_DIR"/*.log; do
+            local log_name=$(basename "$log_file")
+            if [[ "$log_name" =~ ^(.+)_[0-9]+\.log$ ]]; then
+                local service_name="${BASH_REMATCH[1]}"
+                local found=false
+                
+                for current_service in "${current_services[@]}"; do
+                    if [[ "$service_name" == "$current_service" ]]; then
+                        found=true
+                        break
+                    fi
+                done
+                
+                if [[ "$found" == "false" ]]; then
+                    orphaned_logs+=("$log_file")
+                fi
+            fi
+        done
+    fi
+    
+    if [[ ${#orphaned_logs[@]} -gt 0 ]]; then
+        echo
+        print_color $YELLOW "发现 ${#orphaned_logs[@]} 个孤立的日志文件:"
+        for log_file in "${orphaned_logs[@]}"; do
+            echo "  $(basename "$log_file")"
+        done
+        
+        read -p "是否删除这些孤立的日志文件? [y/N]: " clean_logs
+        if [[ "$clean_logs" =~ ^[Yy] ]]; then
+            for log_file in "${orphaned_logs[@]}"; do
+                rm -f "$log_file"
+                print_color $GREEN "✓ 已删除: $(basename "$log_file")"
+            done
+        fi
+    fi
+}
+
+# 手动扫描配置文件
+manual_config_scan() {
+    clear
+    print_color $BLUE "================= 配置文件扫描与同步 ================="
+    echo
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        print_color $YELLOW "配置文件不存在"
+        echo
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    print_color $CYAN "当前配置文件状态:"
+    echo "文件路径: $CONFIG_FILE"
+    echo "文件大小: $(stat -c%s "$CONFIG_FILE" 2>/dev/null || echo "未知") 字节"
+    echo "修改时间: $(stat -c%y "$CONFIG_FILE" 2>/dev/null || echo "未知")"
+    echo
+    
+    # 显示配置文件内容
+    print_color $CYAN "配置文件内容:"
+    local line_num=1
+    while IFS= read -r line; do
+        printf "%3d: %s\n" $line_num "$line"
+        ((line_num++))
+    done < "$CONFIG_FILE"
+    
+    echo
+    print_color $BLUE "======================================================"
+    echo "1. 验证配置文件格式"
+    echo "2. 强制同步配置文件"
+    echo "3. 查看孤立文件"
+    echo "4. 重新组织所有服务文件"
+    echo "5. 启用/禁用自动同步"
+    echo "0. 返回"
+    echo
+    read -p "请选择操作 [0-5]: " choice
+    
+    case $choice in
+        1)
+            echo
+            if validate_config_file; then
+                print_color $GREEN "✓ 配置文件格式正确"
+            fi
+            echo
+            read -p "按回车键继续..."
+            ;;
+        2)
+            echo
+            # 强制同步
+            update_config_checksum  # 重置校验和以触发同步
+            echo "dummy" > "$CONFIG_CHECKSUM_FILE.tmp"
+            mv "$CONFIG_CHECKSUM_FILE.tmp" "$CONFIG_CHECKSUM_FILE"
+            sync_config_changes
+            echo
+            read -p "按回车键继续..."
+            ;;
+        3)
+            echo
+            show_orphaned_files
+            echo
+            read -p "按回车键继续..."
+            ;;
+        4)
+            echo
+            reorganize_all_services
+            echo
+            read -p "按回车键继续..."
+            ;;
+        5)
+            toggle_auto_sync
+            ;;
+        0)
+            return
+            ;;
+        *)
+            print_color $RED "无效选择"
+            sleep 1
+            ;;
+    esac
+}
+
+# 显示孤立文件
+show_orphaned_files() {
+    print_color $CYAN "扫描孤立文件..."
+    
+    # 获取当前配置中的服务
+    local current_services=()
+    if [[ -f "$CONFIG_FILE" ]]; then
+        while IFS='=' read -r name commands; do
+            if [[ -n "$name" ]]; then
+                current_services+=("$name")
+            fi
+        done < "$CONFIG_FILE"
+    fi
+    
+    # 检查PID文件
+    print_color $CYAN "PID文件检查:"
+    local found_orphaned_pid=false
+    if ls "$PID_DIR"/*.pid >/dev/null 2>&1; then
+        for pid_file in "$PID_DIR"/*.pid; do
+            local pid_name=$(basename "$pid_file")
+            if [[ "$pid_name" == "service_keeper_daemon.pid" ]]; then
+                continue
+            fi
+            
+            local service_name="${pid_name%_*.pid}"
+            local found=false
+            
+            for current_service in "${current_services[@]}"; do
+                if [[ "$service_name" == "$current_service" ]]; then
+                    found=true
+                    break
+                fi
+            done
+            
+            if [[ "$found" == "false" ]]; then
+                print_color $YELLOW "  孤立PID: $pid_name"
+                found_orphaned_pid=true
+            fi
+        done
+    fi
+    
+    if [[ "$found_orphaned_pid" == "false" ]]; then
+        print_color $GREEN "  无孤立PID文件"
+    fi
+    
+    # 检查日志文件
+    print_color $CYAN "日志文件检查:"
+    local found_orphaned_log=false
+    if ls "$LOG_DIR"/*.log >/dev/null 2>&1; then
+        for log_file in "$LOG_DIR"/*.log; do
+            local log_name=$(basename "$log_file")
+            if [[ "$log_name" =~ ^(.+)_[0-9]+\.log$ ]]; then
+                local service_name="${BASH_REMATCH[1]}"
+                local found=false
+                
+                for current_service in "${current_services[@]}"; do
+                    if [[ "$service_name" == "$current_service" ]]; then
+                        found=true
+                        break
+                    fi
+                done
+                
+                if [[ "$found" == "false" ]]; then
+                    print_color $YELLOW "  孤立日志: $log_name"
+                    found_orphaned_log=true
+                fi
+            fi
+        done
+    fi
+    
+    if [[ "$found_orphaned_log" == "false" ]]; then
+        print_color $GREEN "  无孤立日志文件"
+    fi
+}
+
+# 重新组织所有服务文件
+reorganize_all_services() {
+    print_color $CYAN "重新组织所有服务文件..."
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        print_color $YELLOW "配置文件不存在"
+        return
+    fi
+    
+    while IFS='=' read -r name commands; do
+        if [[ -n "$name" ]]; then
+            print_color $BLUE "重新组织服务: $name"
+            reorganize_service_files "$name"
+        fi
+    done < "$CONFIG_FILE"
+    
+    print_color $GREEN "✓ 所有服务文件重新组织完成"
+}
+
+# 切换自动同步配置
+toggle_auto_sync() {
+    echo
+    print_color $CYAN "当前自动同步状态: $AUTO_SYNC_CONFIG"
+    
+    if [[ "$AUTO_SYNC_CONFIG" == "true" ]]; then
+        AUTO_SYNC_CONFIG="false"
+        print_color $YELLOW "✓ 自动同步已禁用"
+        print_color $YELLOW "提示: 禁用后需要手动执行同步操作"
+    else
+        AUTO_SYNC_CONFIG="true"
+        print_color $GREEN "✓ 自动同步已启用"
+    fi
+    
+    save_settings
+    sleep 2
+}
 
 # 设置快捷键
 setup_shortcut() {
@@ -96,8 +474,8 @@ setup_shortcut() {
 
 # 检查命令是否运行
 is_command_running() {
-    local service_name=$(clean_service_name "$1")
-    local cmd_index=$2
+    local service_name="$1"
+    local cmd_index="$2"
     local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
     
     if [[ -f "$pid_file" ]]; then
@@ -126,17 +504,39 @@ is_daemon_running() {
     return 1
 }
 
-# 获取服务的所有命令
+# 获取服务的所有命令 - 纯数据函数
 get_service_commands() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     if [[ -f "$CONFIG_FILE" ]]; then
         grep "^${service_name}=" "$CONFIG_FILE" | cut -d'=' -f2-
     fi
 }
 
+# 根据索引获取服务名 - 纯数据函数
+get_service_by_index() {
+    local target_index="$1"
+    local current_index=1
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+    
+    while IFS='=' read -r name commands; do
+        if [[ -n "$name" ]]; then
+            if [[ $current_index -eq $target_index ]]; then
+                echo "$name"
+                return 0
+            fi
+            ((current_index++))
+        fi
+    done < "$CONFIG_FILE"
+    
+    return 1
+}
+
 # 获取日志文件大小
 get_human_readable_size() {
-    local file=$1
+    local file="$1"
     if [[ ! -f "$file" ]]; then
         echo "0B"
         return
@@ -157,7 +557,7 @@ get_human_readable_size() {
 
 # 检查并清理日志文件
 check_and_clean_log() {
-    local log_file=$1
+    local log_file="$1"
     
     if [[ ! -f "$log_file" ]] || [[ "$LOG_AUTO_CLEAN" != "true" ]]; then
         return 0
@@ -180,7 +580,7 @@ check_and_clean_log() {
 
 # 轮转日志文件
 rotate_log_file() {
-    local log_file=$1
+    local log_file="$1"
     local dir_name=$(dirname "$log_file")
     local base_name=$(basename "$log_file" .log)
     
@@ -208,6 +608,9 @@ rotate_log_file() {
 
 # 显示服务概要
 show_service_summary() {
+    # 在显示前同步配置
+    sync_config_changes
+    
     if [[ ! -f "$CONFIG_FILE" ]]; then
         print_color $YELLOW "当前无配置服务"
         return
@@ -252,12 +655,17 @@ show_service_summary() {
         done
         echo
     fi
+    
+    # 显示配置文件状态
+    if config_changed; then
+        print_color $YELLOW "⚠ 配置文件已修改，建议同步"
+    fi
 }
 
 # 显示主菜单
 show_main_menu() {
     clear
-    print_color $BLUE "====================== 服务保活管理器 ======================"
+    print_color $BLUE "====================== 服务保活管理器 v2.8 ======================"
     print_color $GREEN "1. 添加新服务"
     print_color $GREEN "2. 管理现有服务"
     print_color $GREEN "3. 启动服务"
@@ -269,11 +677,12 @@ show_main_menu() {
     print_color $CYAN "9. 启动保活守护进程"
     print_color $CYAN "10. 停止保活守护进程"
     print_color $PURPLE "11. 日志管理设置"
-    print_color $YELLOW "12. 设置开机自启"
-    print_color $YELLOW "13. 取消开机自启"
-    print_color $PURPLE "14. 设置快捷键"
+    print_color $PURPLE "12. 配置文件扫描同步"  # 新增
+    print_color $YELLOW "13. 设置开机自启"
+    print_color $YELLOW "14. 取消开机自启"
+    print_color $PURPLE "15. 设置快捷键"
     print_color $RED "0. 退出"
-    print_color $BLUE "=========================================================="
+    print_color $BLUE "======================================================================"
     
     if is_daemon_running; then
         print_color $GREEN "保活守护进程: 运行中"
@@ -283,11 +692,14 @@ show_main_menu() {
     
     show_service_summary
     echo
-    echo -n "请选择操作 [0-14]: "
+    echo -n "请选择操作 [0-15]: "
 }
 
-# 显示服务列表 - 增强版本
+# 显示服务列表
 show_services_list() {
+    # 在显示前同步配置
+    sync_config_changes
+    
     if [[ ! -f "$CONFIG_FILE" ]]; then
         print_color $YELLOW "暂无配置的服务"
         return 1
@@ -302,9 +714,6 @@ show_services_list() {
         if [[ -n "$name" ]]; then
             has_services=true
             
-            # 清理服务名
-            local clean_name=$(clean_service_name "$name")
-            
             # 使用数组处理命令
             local cmd_array=()
             while IFS= read -r line; do
@@ -315,7 +724,7 @@ show_services_list() {
             local running_count=0
             
             for ((i=1; i<=cmd_count; i++)); do
-                if is_command_running "$clean_name" "$i"; then
+                if is_command_running "$name" "$i"; then
                     ((running_count++))
                 fi
             done
@@ -332,7 +741,7 @@ show_services_list() {
                 fi
             fi
             
-            printf "%2d. %-20s " $index "$clean_name"
+            printf "%2d. %-20s " $index "$name"
             print_color $status_color "[$status]"
             printf " 命令数: %d (运行: %d)\n" "$cmd_count" "$running_count"
             
@@ -344,7 +753,7 @@ show_services_list() {
                     local cmd_status="停止"
                     local cmd_color=$RED
                     
-                    if is_command_running "$clean_name" "$cmd_index"; then
+                    if is_command_running "$name" "$cmd_index"; then
                         cmd_status="运行"
                         cmd_color=$GREEN
                     fi
@@ -371,40 +780,16 @@ show_services_list() {
     return 0
 }
 
-# 根据索引获取服务名 - 修复版本
-get_service_by_index() {
-    local target_index=$1
-    local current_index=1
-    
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        return 1
-    fi
-    
-    while IFS='=' read -r name commands; do
-        if [[ -n "$name" ]]; then
-            if [[ $current_index -eq $target_index ]]; then
-                # 返回清理后的服务名
-                clean_service_name "$name"
-                return 0
-            fi
-            ((current_index++))
-        fi
-    done < "$CONFIG_FILE"
-    
-    return 1
-}
-
-# 选择服务
-select_service() {
-    local action=$1
+# 选择并管理服务 - 修复架构问题
+select_and_manage_service() {
     clear
-    print_color $BLUE "================= $action ================="
+    print_color $BLUE "================= 管理现有服务 ================="
     echo
     
     if ! show_services_list; then
         echo
         read -p "按回车键返回主菜单..."
-        return 1
+        return
     fi
     
     echo
@@ -412,7 +797,7 @@ select_service() {
     read -p "请输入服务序号 (0返回主菜单): " choice
     
     if [[ "$choice" == "0" ]]; then
-        return 1
+        return
     fi
     
     local service_name
@@ -421,16 +806,193 @@ select_service() {
     if [[ -z "$service_name" ]]; then
         print_color $RED "无效的服务序号"
         sleep 2
-        return 1
+        return
     fi
     
-    echo "$service_name"
+    manage_service "$service_name"
+}
+
+# 选择并启动服务
+select_and_start_service() {
+    clear
+    print_color $BLUE "================= 启动服务 ================="
+    echo
+    
+    if ! show_services_list; then
+        echo
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo
+    print_color $BLUE "======================================================"
+    read -p "请输入服务序号 (0返回主菜单): " choice
+    
+    if [[ "$choice" == "0" ]]; then
+        return
+    fi
+    
+    local service_name
+    service_name=$(get_service_by_index "$choice")
+    
+    if [[ -z "$service_name" ]]; then
+        print_color $RED "无效的服务序号"
+        sleep 2
+        return
+    fi
+    
+    echo
+    start_all_commands "$service_name"
+    echo
+    read -p "按回车键继续..."
+}
+
+# 选择并停止服务
+select_and_stop_service() {
+    clear
+    print_color $BLUE "================= 停止服务 ================="
+    echo
+    
+    if ! show_services_list; then
+        echo
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo
+    print_color $BLUE "======================================================"
+    read -p "请输入服务序号 (0返回主菜单): " choice
+    
+    if [[ "$choice" == "0" ]]; then
+        return
+    fi
+    
+    local service_name
+    service_name=$(get_service_by_index "$choice")
+    
+    if [[ -z "$service_name" ]]; then
+        print_color $RED "无效的服务序号"
+        sleep 2
+        return
+    fi
+    
+    echo
+    stop_all_commands "$service_name"
+    echo
+    read -p "按回车键继续..."
+}
+
+# 选择并重启服务
+select_and_restart_service() {
+    clear
+    print_color $BLUE "================= 重启服务 ================="
+    echo
+    
+    if ! show_services_list; then
+        echo
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo
+    print_color $BLUE "======================================================"
+    read -p "请输入服务序号 (0返回主菜单): " choice
+    
+    if [[ "$choice" == "0" ]]; then
+        return
+    fi
+    
+    local service_name
+    service_name=$(get_service_by_index "$choice")
+    
+    if [[ -z "$service_name" ]]; then
+        print_color $RED "无效的服务序号"
+        sleep 2
+        return
+    fi
+    
+    echo
+    print_color $BLUE "重启服务: $service_name"
+    stop_all_commands "$service_name"
+    echo
+    sleep 2
+    start_all_commands "$service_name"
+    echo
+    read -p "按回车键继续..."
+}
+
+# 选择并查看服务日志
+select_and_show_logs() {
+    clear
+    print_color $BLUE "================= 查看服务日志 ================="
+    echo
+    
+    if ! show_services_list; then
+        echo
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo
+    print_color $BLUE "======================================================"
+    read -p "请输入服务序号 (0返回主菜单): " choice
+    
+    if [[ "$choice" == "0" ]]; then
+        return
+    fi
+    
+    local service_name
+    service_name=$(get_service_by_index "$choice")
+    
+    if [[ -z "$service_name" ]]; then
+        print_color $RED "无效的服务序号"
+        sleep 2
+        return
+    fi
+    
+    show_service_logs "$service_name"
+}
+
+# 选择并删除服务
+select_and_delete_service() {
+    clear
+    print_color $BLUE "================= 删除服务 ================="
+    echo
+    
+    if ! show_services_list; then
+        echo
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo
+    print_color $BLUE "======================================================"
+    read -p "请输入服务序号 (0返回主菜单): " choice
+    
+    if [[ "$choice" == "0" ]]; then
+        return
+    fi
+    
+    local service_name
+    service_name=$(get_service_by_index "$choice")
+    
+    if [[ -z "$service_name" ]]; then
+        print_color $RED "无效的服务序号"
+        sleep 2
+        return
+    fi
+    
+    echo
+    if confirm_delete_service "$service_name"; then
+        echo
+        read -p "按回车键继续..."
+    fi
 }
 
 # 启动单个命令
 start_command() {
-    local service_name=$(clean_service_name "$1")
-    local cmd_index=$2
+    local service_name="$1"
+    local cmd_index="$2"
     local command="$3"
     local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
     local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
@@ -460,8 +1022,8 @@ start_command() {
 
 # 停止单个命令
 stop_command() {
-    local service_name=$(clean_service_name "$1")
-    local cmd_index=$2
+    local service_name="$1"
+    local cmd_index="$2"
     local pid_file="$PID_DIR/${service_name}_${cmd_index}.pid"
     
     if ! is_command_running "$service_name" "$cmd_index"; then
@@ -486,7 +1048,7 @@ stop_command() {
 
 # 启动服务的所有命令
 start_all_commands() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -511,7 +1073,7 @@ start_all_commands() {
 
 # 停止服务的所有命令
 stop_all_commands() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -535,10 +1097,7 @@ add_service() {
     echo
     read -p "请输入服务名称: " service_name
     
-    # 清理服务名
-    service_name=$(clean_service_name "$service_name")
-    
-    if [[ -z "$service_name" ]]; then
+    if [[ -z "$service_name" ]] || [[ ! "$service_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         print_color $RED "服务名称格式错误（只能包含字母、数字、下划线和短横线）"
         sleep 2
         return
@@ -624,6 +1183,7 @@ add_service() {
     fi
     
     echo "$service_name=$commands" >> "$CONFIG_FILE"
+    update_config_checksum  # 更新校验和
     print_color $GREEN "✓ 服务 '$service_name' 创建成功！"
     
     echo
@@ -637,34 +1197,13 @@ add_service() {
     read -p "按回车键继续..."
 }
 
-# 管理现有服务菜单
-manage_existing_service_menu() {
-    local service_name
-    service_name=$(select_service "管理现有服务")
-    
-    if [[ $? -eq 0 && -n "$service_name" ]]; then
-        manage_service "$service_name"
-    fi
-}
-
-# 管理单个服务 - 完全修复版本
+# 管理单个服务
 manage_service() {
     local service_name="$1"
-    
-    # 清理服务名中的异常字符
-    service_name=$(clean_service_name "$service_name")
     
     # 验证服务是否存在
     if [[ ! -f "$CONFIG_FILE" ]] || ! grep -q "^${service_name}=" "$CONFIG_FILE"; then
         print_color $RED "错误: 服务 '$service_name' 不存在"
-        echo
-        print_color $CYAN "调试信息:"
-        echo "  原始参数: '$1'"
-        echo "  清理后: '$service_name'"
-        echo "  配置文件中的服务:"
-        if [[ -f "$CONFIG_FILE" ]]; then
-            grep "^[^=]*=" "$CONFIG_FILE" | cut -d'=' -f1 | sed 's/^/    /'
-        fi
         echo
         read -p "按回车键继续..."
         return
@@ -738,9 +1277,9 @@ manage_service() {
     done
 }
 
-# 显示服务详细信息 - 完全修复版本
+# 显示服务详细信息
 show_service_details() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     
     if [[ -z "$service_name" ]]; then
         print_color $RED "错误: 服务名为空"
@@ -799,7 +1338,7 @@ show_service_details() {
 
 # 添加命令到现有服务
 add_command_to_service() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     
     clear
     print_color $BLUE "================ 为服务 '$service_name' 添加新命令 ================"
@@ -831,12 +1370,13 @@ add_command_to_service() {
     current_commands=$(get_service_commands "$service_name")
     local new_commands="${current_commands}|${new_command}"
     
+    # 更新配置文件
     if [[ -f "$CONFIG_FILE" ]]; then
-        # 使用临时文件确保安全更新
         local temp_file="${CONFIG_FILE}.tmp"
         grep -v "^${service_name}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
         echo "${service_name}=${new_commands}" >> "$temp_file"
         mv "$temp_file" "$CONFIG_FILE"
+        update_config_checksum  # 更新校验和
     fi
     
     print_color $GREEN "✓ 新命令添加成功！"
@@ -853,9 +1393,9 @@ add_command_to_service() {
     read -p "按回车键继续..."
 }
 
-# 删除服务中的命令 - 修复版本
+# 删除服务中的命令
 remove_command_from_service() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -938,12 +1478,13 @@ remove_command_from_service() {
         fi
     done
     
+    # 更新配置文件
     if [[ -f "$CONFIG_FILE" ]]; then
-        # 使用临时文件确保安全更新
         local temp_file="${CONFIG_FILE}.tmp"
         grep -v "^${service_name}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
         echo "${service_name}=${new_commands}" >> "$temp_file"
         mv "$temp_file" "$CONFIG_FILE"
+        update_config_checksum  # 更新校验和
     fi
     
     reorganize_service_files "$service_name"
@@ -955,7 +1496,7 @@ remove_command_from_service() {
 
 # 重新整理服务文件
 reorganize_service_files() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -994,9 +1535,9 @@ reorganize_service_files() {
     done
 }
 
-# 修改服务中的命令 - 修复版本
+# 修改服务中的命令
 modify_command_in_service() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -1067,12 +1608,13 @@ modify_command_in_service() {
         fi
     done
     
+    # 更新配置文件
     if [[ -f "$CONFIG_FILE" ]]; then
-        # 使用临时文件确保安全更新
         local temp_file="${CONFIG_FILE}.tmp"
         grep -v "^${service_name}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
         echo "${service_name}=${new_commands}" >> "$temp_file"
         mv "$temp_file" "$CONFIG_FILE"
+        update_config_checksum  # 更新校验和
     fi
     
     print_color $GREEN "✓ 命令修改成功！"
@@ -1090,25 +1632,25 @@ modify_command_in_service() {
 
 # 启动单个命令菜单
 start_single_command_menu() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     select_and_operate_command "$service_name" "启动" "start"
 }
 
 # 停止单个命令菜单
 stop_single_command_menu() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     select_and_operate_command "$service_name" "停止" "stop"
 }
 
 # 重启单个命令菜单
 restart_single_command_menu() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     select_and_operate_command "$service_name" "重启" "restart"
 }
 
-# 选择并操作命令 - 修复版本
+# 选择并操作命令
 select_and_operate_command() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local action="$2"
     local operation="$3"
     local commands
@@ -1180,7 +1722,7 @@ select_and_operate_command() {
 
 # 确认删除服务
 confirm_delete_service() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     
     print_color $RED "警告: 即将删除服务 '$service_name' 及其所有命令！"
     print_color $YELLOW "这将会："
@@ -1203,54 +1745,14 @@ confirm_delete_service() {
     fi
 }
 
-# 启动服务菜单
-start_service_menu() {
-    local service_name
-    service_name=$(select_service "启动服务")
-    
-    if [[ $? -eq 0 && -n "$service_name" ]]; then
-        echo
-        start_all_commands "$service_name"
-        echo
-        read -p "按回车键继续..."
-    fi
-}
-
-# 停止服务菜单
-stop_service_menu() {
-    local service_name
-    service_name=$(select_service "停止服务")
-    
-    if [[ $? -eq 0 && -n "$service_name" ]]; then
-        echo
-        stop_all_commands "$service_name"
-        echo
-        read -p "按回车键继续..."
-    fi
-}
-
-# 重启服务菜单
-restart_service_menu() {
-    local service_name
-    service_name=$(select_service "重启服务")
-    
-    if [[ $? -eq 0 && -n "$service_name" ]]; then
-        echo
-        print_color $BLUE "重启服务: $service_name"
-        stop_all_commands "$service_name"
-        echo
-        sleep 2
-        start_all_commands "$service_name"
-        echo
-        read -p "按回车键继续..."
-    fi
-}
-
-# 查看服务状态 - 修复版本
+# 查看服务状态
 show_status() {
     clear
     print_color $BLUE "====================== 服务状态总览 ======================"
     echo
+    
+    # 在显示状态前同步配置
+    sync_config_changes
     
     if [[ ! -f "$CONFIG_FILE" ]]; then
         print_color $YELLOW "暂无配置的服务"
@@ -1268,7 +1770,6 @@ show_status() {
         if [[ -n "$name" ]]; then
             ((total_services++))
             local service_running=false
-            local clean_name=$(clean_service_name "$name")
             
             # 使用数组避免子shell问题
             local cmd_array=()
@@ -1280,7 +1781,7 @@ show_status() {
             total_commands=$((total_commands + cmd_count))
             local service_running_count=0
             
-            print_color $CYAN "服务: $clean_name"
+            print_color $CYAN "服务: $name"
             
             for i in "${!cmd_array[@]}"; do
                 local cmd_index=$((i + 1))
@@ -1289,14 +1790,14 @@ show_status() {
                 local color=$RED
                 local pid="N/A"
                 
-                if is_command_running "$clean_name" "$cmd_index"; then
+                if is_command_running "$name" "$cmd_index"; then
                     status="运行中"
                     color=$GREEN
                     service_running=true
                     ((running_commands++))
                     ((service_running_count++))
                     
-                    local pid_file="$PID_DIR/${clean_name}_${cmd_index}.pid"
+                    local pid_file="$PID_DIR/${name}_${cmd_index}.pid"
                     if [[ -f "$pid_file" ]]; then
                         pid=$(cat "$pid_file")
                     fi
@@ -1306,7 +1807,7 @@ show_status() {
                 print_color $color "[$status]"
                 printf " PID: %-8s %s\n" "$pid" "$cmd"
                 
-                local log_file="$LOG_DIR/${clean_name}_${cmd_index}.log"
+                local log_file="$LOG_DIR/${name}_${cmd_index}.log"
                 local log_size=$(get_human_readable_size "$log_file")
                 printf "           日志: %s\n" "$log_size"
             done
@@ -1332,24 +1833,15 @@ show_status() {
     fi
     
     print_color $CYAN "日志设置: 大小限制 $LOG_MAX_SIZE, 自动清理 $LOG_AUTO_CLEAN, 备份数量 $LOG_BACKUP_COUNT"
+    print_color $CYAN "配置同步: $AUTO_SYNC_CONFIG"
     
     echo
     read -p "按回车键返回主菜单..."
 }
 
-# 查看日志菜单
-show_logs_menu() {
-    local service_name
-    service_name=$(select_service "查看服务日志")
-    
-    if [[ $? -eq 0 && -n "$service_name" ]]; then
-        show_service_logs "$service_name"
-    fi
-}
-
-# 查看服务日志 - 修复版本
+# 查看服务日志
 show_service_logs() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -1412,7 +1904,7 @@ show_service_logs() {
 
 # 显示单个命令的日志
 show_single_log() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local cmd_index="$2"
     local log_file="$LOG_DIR/${service_name}_${cmd_index}.log"
     
@@ -1462,9 +1954,9 @@ show_single_log() {
     fi
 }
 
-# 显示所有服务日志 - 修复版本
+# 显示所有服务日志
 show_all_service_logs() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     local commands
     commands=$(get_service_commands "$service_name")
     
@@ -1495,29 +1987,16 @@ show_all_service_logs() {
     read -p "按回车键继续..."
 }
 
-# 删除服务菜单
-delete_service_menu() {
-    local service_name
-    service_name=$(select_service "删除服务")
-    
-    if [[ $? -eq 0 && -n "$service_name" ]]; then
-        echo
-        if confirm_delete_service "$service_name"; then
-            echo
-            read -p "按回车键继续..."
-        fi
-    fi
-}
-
 # 删除服务
 delete_service() {
-    local service_name=$(clean_service_name "$1")
+    local service_name="$1"
     
     stop_all_commands "$service_name"
     
     if [[ -f "$CONFIG_FILE" ]]; then
         grep -v "^${service_name}=" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null || true
         mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" 2>/dev/null || true
+        update_config_checksum  # 更新校验和
     fi
     
     rm -f "$PID_DIR/${service_name}_"*.pid
@@ -1685,18 +2164,19 @@ stop_daemon() {
     print_color $GREEN "✓ 保活守护进程已停止"
 }
 
-# 守护进程主循环 - 修复版本
+# 守护进程主循环
 daemon_loop() {
     echo "$(date): 保活守护进程启动" >> "$LOG_DIR/daemon.log"
     
     while true; do
         load_settings
         
+        # 同步配置文件变化
+        sync_config_changes
+        
         if [[ -f "$CONFIG_FILE" ]]; then
             while IFS='=' read -r name commands; do
                 if [[ -n "$name" ]]; then
-                    local clean_name=$(clean_service_name "$name")
-                    
                     # 使用数组避免子shell问题
                     local cmd_array=()
                     while IFS= read -r line; do
@@ -1707,11 +2187,11 @@ daemon_loop() {
                         local cmd_index=$((i + 1))
                         local cmd="${cmd_array[i]}"
                         
-                        if ! is_command_running "$clean_name" "$cmd_index"; then
-                            echo "$(date): 检测到服务 '$clean_name' 命令 $cmd_index 已停止，正在重启..." >> "$LOG_DIR/daemon.log"
-                            start_command "$clean_name" "$cmd_index" "$cmd" >> "$LOG_DIR/daemon.log" 2>&1
+                        if ! is_command_running "$name" "$cmd_index"; then
+                            echo "$(date): 检测到服务 '$name' 命令 $cmd_index 已停止，正在重启..." >> "$LOG_DIR/daemon.log"
+                            start_command "$name" "$cmd_index" "$cmd" >> "$LOG_DIR/daemon.log" 2>&1
                         else
-                            local log_file="$LOG_DIR/${clean_name}_${cmd_index}.log"
+                            local log_file="$LOG_DIR/${name}_${cmd_index}.log"
                             check_and_clean_log "$log_file"
                         fi
                     done
@@ -1785,9 +2265,8 @@ autostart_all() {
     
     while IFS='=' read -r name commands; do
         if [[ -n "$name" ]]; then
-            local clean_name=$(clean_service_name "$name")
-            echo "$(date): 启动服务 $clean_name" >> "$LOG_DIR/autostart.log"
-            start_all_commands "$clean_name" >> "$LOG_DIR/autostart.log" 2>&1
+            echo "$(date): 启动服务 $name" >> "$LOG_DIR/autostart.log"
+            start_all_commands "$name" >> "$LOG_DIR/autostart.log" 2>&1
             sleep 2
         fi
     done < "$CONFIG_FILE"
@@ -1818,9 +2297,13 @@ case "$1" in
         setup_shortcut
         exit 0
         ;;
+    --sync-config)
+        sync_config_changes
+        exit 0
+        ;;
     --help|-h)
         echo "Service Keeper - 服务保活管理器"
-        echo "版本: 2.4 彻底修复版"
+        echo "版本: 2.8 配置文件扫描修复版"
         echo "用法: $0 [选项]"
         echo ""
         echo "选项:"
@@ -1829,6 +2312,7 @@ case "$1" in
         echo "  --start-daemon   启动守护进程"
         echo "  --stop-daemon    停止守护进程"
         echo "  --setup-shortcut 设置快捷键"
+        echo "  --sync-config    同步配置文件变化"
         echo "  --help, -h       显示此帮助信息"
         echo ""
         echo "功能特性:"
@@ -1839,7 +2323,9 @@ case "$1" in
         echo "  • 详细状态监控"
         echo "  • 动态服务管理"
         echo "  • 快捷键支持"
-        echo "  • 服务名清理功能"
+        echo "  • 配置文件扫描同步"
+        echo "  • 孤立文件清理"
+        echo "  • 配置格式验证"
         exit 0
         ;;
 esac
@@ -1854,25 +2340,25 @@ while true; do
             add_service
             ;;
         2) 
-            manage_existing_service_menu
+            select_and_manage_service
             ;;
         3) 
-            start_service_menu
+            select_and_start_service
             ;;
         4)
-            stop_service_menu
+            select_and_stop_service
             ;;
         5)
-            restart_service_menu
+            select_and_restart_service
             ;;
         6) 
             show_status
             ;;
         7) 
-            show_logs_menu
+            select_and_show_logs
             ;;
         8) 
-            delete_service_menu
+            select_and_delete_service
             ;;
         9)
             echo
@@ -1889,19 +2375,22 @@ while true; do
         11)
             log_management_menu
             ;;
-        12) 
+        12)
+            manual_config_scan
+            ;;
+        13) 
             echo
             setup_autostart
             echo
             read -p "按回车键继续..."
             ;;
-        13) 
+        14) 
             echo
             remove_autostart
             echo
             read -p "按回车键继续..."
             ;;
-        14)
+        15)
             echo
             setup_shortcut
             echo
