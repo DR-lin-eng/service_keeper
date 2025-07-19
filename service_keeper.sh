@@ -174,9 +174,29 @@ list_services() {
 
 # 选择服务
 select_service() {
-    if ! list_services; then
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        print_color $YELLOW "暂无配置的服务"
         return 1
     fi
+    
+    print_color $BLUE "=== 已配置的服务 ==="
+    local index=1
+    while IFS='=' read -r name command; do
+        if [[ -n "$name" ]]; then
+            local status="已停止"
+            local color=$RED
+            if is_service_running "$name"; then
+                status="运行中"
+                color=$GREEN
+            fi
+            
+            printf "%2d. %-20s " $index "$name"
+            print_color $color "[$status]"
+            printf " %s\n" "$command"
+            ((index++))
+        fi
+    done < "$CONFIG_FILE"
+    
     echo
     read -p "请输入服务名称: " service_name
     
@@ -185,12 +205,14 @@ select_service() {
         return 1
     fi
     
+    # 验证服务是否存在
     if ! grep -q "^${service_name}=" "$CONFIG_FILE" 2>/dev/null; then
         print_color $RED "服务 '$service_name' 不存在"
         return 1
     fi
     
-    echo "$service_name"
+    # 直接输出服务名称到标准输出
+    printf "%s" "$service_name"
 }
 
 # 获取服务命令
@@ -244,26 +266,27 @@ show_status() {
 
 # 查看日志
 show_logs() {
-    local service_name
-    service_name=$(select_service) || return 1
-    
-    local log_file="$LOG_DIR/${service_name}.log"
-    if [[ -f "$log_file" ]]; then
-        print_color $BLUE "=== $service_name 服务日志 ==="
-        echo "日志文件: $log_file"
-        echo "----------------------------------------"
-        tail -n 50 "$log_file"
-        echo
-        read -p "按回车键继续..."
-    else
-        print_color $YELLOW "日志文件不存在: $log_file"
+    echo
+    service_name=$(select_service)
+    if [[ $? -eq 0 && -n "$service_name" ]]; then
+        local log_file="$LOG_DIR/${service_name}.log"
+        if [[ -f "$log_file" ]]; then
+            print_color $BLUE "=== $service_name 服务日志 ==="
+            echo "日志文件: $log_file"
+            echo "----------------------------------------"
+            tail -n 50 "$log_file"
+            echo
+            read -p "按回车键继续..."
+        else
+            print_color $YELLOW "日志文件不存在: $log_file"
+            read -p "按回车键继续..."
+        fi
     fi
 }
 
 # 删除服务
 delete_service() {
-    local service_name
-    service_name=$(select_service) || return 1
+    local service_name=$1
     
     # 先停止服务
     if is_service_running "$service_name"; then
@@ -369,27 +392,43 @@ while true; do
     case $choice in
         1) add_service ;;
         2) 
-            service_name=$(select_service) || continue
-            command=$(get_service_command "$service_name")
-            start_service "$service_name" "$command"
+            echo
+            service_name=$(select_service)
+            if [[ $? -eq 0 && -n "$service_name" ]]; then
+                command=$(get_service_command "$service_name")
+                start_service "$service_name" "$command"
+            fi
             ;;
         3)
-            service_name=$(select_service) || continue
-            stop_service "$service_name"
+            echo
+            service_name=$(select_service)
+            if [[ $? -eq 0 && -n "$service_name" ]]; then
+                stop_service "$service_name"
+            fi
             ;;
         4)
-            service_name=$(select_service) || continue
-            command=$(get_service_command "$service_name")
-            stop_service "$service_name"
-            sleep 1
-            start_service "$service_name" "$command"
+            echo
+            service_name=$(select_service)
+            if [[ $? -eq 0 && -n "$service_name" ]]; then
+                command=$(get_service_command "$service_name")
+                stop_service "$service_name"
+                sleep 1
+                start_service "$service_name" "$command"
+            fi
             ;;
         5) 
             show_status
+            echo
             read -p "按回车键继续..."
             ;;
         6) show_logs ;;
-        7) delete_service ;;
+        7) 
+            echo
+            service_name=$(select_service)
+            if [[ $? -eq 0 && -n "$service_name" ]]; then
+                delete_service "$service_name"
+            fi
+            ;;
         8) setup_autostart ;;
         9) remove_autostart ;;
         0) 
@@ -401,7 +440,7 @@ while true; do
             ;;
     esac
     
-    if [[ "$choice" != "5" && "$choice" != "6" ]]; then
+    if [[ "$choice" != "5" && "$choice" != "6" && "$choice" != "0" ]]; then
         echo
         read -p "按回车键继续..."
     fi
