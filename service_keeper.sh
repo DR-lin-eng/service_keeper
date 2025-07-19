@@ -156,13 +156,17 @@ list_services() {
     local index=1
     while IFS='=' read -r name command; do
         if [[ -n "$name" ]]; then
-            local status="停止"
+            local status="已停止"
             local color=$RED
             if is_service_running "$name"; then
                 status="运行中"
                 color=$GREEN
             fi
-            printf "%2d. %-20s [%s] %s\n" $index "$name" "$(print_color $color $status)" "$command"
+            
+            # 修复颜色输出问题
+            local status_colored
+            status_colored=$(print_color $color "$status")
+            printf "%2d. %-20s [%s] %s\n" $index "$name" "$status_colored" "$command"
             ((index++))
         fi
     done < "$CONFIG_FILE"
@@ -197,7 +201,46 @@ get_service_command() {
 # 查看服务状态
 show_status() {
     echo
-    list_services
+    print_color $BLUE "=== 服务状态总览 ==="
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        print_color $YELLOW "暂无配置的服务"
+        return 1
+    fi
+    
+    local total_services=0
+    local running_services=0
+    
+    while IFS='=' read -r name command; do
+        if [[ -n "$name" ]]; then
+            ((total_services++))
+            local status="已停止"
+            local color=$RED
+            local pid="N/A"
+            
+            if is_service_running "$name"; then
+                status="运行中"
+                color=$GREEN
+                ((running_services++))
+                local pid_file="$PID_DIR/${name}.pid"
+                if [[ -f "$pid_file" ]]; then
+                    pid=$(cat "$pid_file")
+                fi
+            fi
+            
+            printf "%-20s [%s] PID: %-8s %s\n" \
+                "$name" \
+                "$(print_color $color $status)" \
+                "$pid" \
+                "$command"
+        fi
+    done < "$CONFIG_FILE"
+    
+    echo
+    print_color $BLUE "统计信息:"
+    print_color $GREEN "总服务数: $total_services"
+    print_color $GREEN "运行中: $running_services"
+    print_color $RED "已停止: $((total_services - running_services))"
 }
 
 # 查看日志
@@ -342,7 +385,10 @@ while true; do
             sleep 1
             start_service "$service_name" "$command"
             ;;
-        5) show_status ;;
+        5) 
+            show_status
+            read -p "按回车键继续..."
+            ;;
         6) show_logs ;;
         7) delete_service ;;
         8) setup_autostart ;;
@@ -356,7 +402,7 @@ while true; do
             ;;
     esac
     
-    if [[ "$choice" != "5" ]]; then
+    if [[ "$choice" != "5" && "$choice" != "6" ]]; then
         echo
         read -p "按回车键继续..."
     fi
